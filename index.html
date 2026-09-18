@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GeoPhoto Offline Tracker</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 15px; background: #f4f4f9; color: #333; margin: 0; }
+    .header { text-align: center; margin-bottom: 15px; }
+    .card { background: white; padding: 15px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); margin-bottom: 15px; }
+    
+    /* Bottoni e Stati */
+    .btn { background: #0066cc; color: white; padding: 12px 18px; border: none; border-radius: 6px; font-size: 16px; font-weight: bold; width: 100%; margin: 5px 0; cursor: pointer; transition: background 0.2s; }
+    .btn:active { background: #0055aa; }
+    .btn:disabled { background: #ccc; cursor: not-allowed; }
+    .btn-sync { background: #28a745; }
+    .btn-sync:active { background: #218838; }
+    .btn-confirm { background: #ffc107; color: #333; margin-top: 10px; } /* Giallo per distinguere */
+    .btn-single { background: #17a2b8; padding: 6px 10px; font-size: 12px; margin-top: 6px; }
+    .btn-delete { background: #dc3545; padding: 6px 10px; font-size: 12px; margin-top: 4px; }
+    
+    .status { font-weight: bold; padding: 5px 10px; border-radius: 4px; display: inline-block; margin-bottom: 10px; font-size: 14px; }
+    .online { background: #d4edda; color: #155724; }
+    .offline { background: #f8d7da; color: #721c24; }
+
+    /* Area Anteprima Scatto Corrente */
+    #previewArea { display: none; text-align: center; }
+    #currentPreviewImg { max-width: 100%; max-height: 300px; border-radius: 6px; border: 2px solid #ffc107; margin-top: 10px; object-fit: contain; }
+    .data-label { font-size: 12px; color: #666; display: block; margin-top: 5px; text-align: left; background: #f9f9f9; padding: 5px; border-radius: 4px;}
+
+    /* Galleria Foto Salvate */
+    .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; margin-top: 15px; }
+    .photo-item { background: #fff; border: 1px solid #ddd; padding: 10px; border-radius: 6px; font-size: 11px; text-align: left; display: flex; flex-direction: column; justify-content: space-between; }
+    .photo-item img { width: 100%; height: 110px; object-fit: cover; border-radius: 4px; margin-bottom: 6px; }
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <h2>GeoPhoto Tracker</h2>
+  </div>
+
+  <!-- SEZIONE ATTIVA: SCATTO E ANTEPRIMA -->
+  <div class="card">
+    <div id="netStatus" class="status offline">Stato: Offline</div>
+    
+    <!-- Input nascosto per fotocamera nativa -->
+    <input type="file" id="cameraInput" accept="image/*" capture="environment" style="display:none;">
+    
+    <!-- Fase 1: Avvia acquisizione GPS e Fotocamera -->
+    <button class="btn" id="startBtn" onclick="avviaAcquisizione()">📷 Scatta Nuova Foto GPS</button>
+
+    <!-- Fase 2: Area Anteprima e Conferma (inizialmente nascosta) -->
+    <div id="previewArea">
+      <h3>Anteprima Scatto Corrente</h3>
+      <img id="currentPreviewImg" src="" alt="Anteprima">
+      <div id="currentGPSData" class="data-label">Attesa dati GPS...</div>
+      <button class="btn btn-confirm" id="saveBtn" onclick="salvaRilievoDefinitivo()">✅ Conferma e Salva Offline</button>
+      <button class="btn btn-delete" style="width: auto; padding: 8px 15px;" onclick="annullaScatto()">🗑️ Annulla</button>
+    </div>
+  </div>
+
+  <!-- SEZIONE CODA: FOTO SALVATE -->
+  <div class="card">
+    <h3>Foto in Coda Locale (<span id="count">0</span>)</h3>
+    <button class="btn btn-sync" onclick="inviaTuttoViaMail()">✉️ Invia TUTTI i Rilievi via Email</button>
+    <div id="gallery" class="gallery"></div>
+  </div>
+
+  <script>
+    let db;
+    let tempCoords = null; // Memorizza temporaneamente le coordinate durante l'anteprima
+    let tempPhotoBase64 = null; // Memorizza temporaneamente la foto durante l'anteprima
+
+    // 1. Inizializzazione IndexedDB (Database Locale)
+    const request = indexedDB.open("GeoPhotosDB", 1);
+    request.onupgradeneeded = (e) => {
+      db = e.target.result;
+      if (!db.objectStoreNames.contains("rilievi")) {
+        db.createObjectStore("rilievi", { keyPath: "id", autoIncrement: true });
+      }
+    };
+    request.onsuccess = (e) => {
+      db = e.target.result;
+      aggiornaGalleria();
+    };
+
+    // Monitoraggio stato connessione
+    function aggiornaStatoRete() {
+      const statusEl = document.getElementById("netStatus");
+      if (navigator.onLine) {
+        statusEl.innerText = "Connesso (Online)";
+        statusEl.className = "status online";
+      } else {
+        statusEl.innerText = "Non Connesso (Offline)";
+        statusEl.className = "status offline";
+      }
+    }
+    window.addEventListener('online', aggiornaStatoRete);
+    window.addEventListener('offline', aggiornaStatoRete);
+    aggiornaStatoRete();
+
+    // 2. FASE 1: Acquisizione GPS e Scatto
+    function avviaAcquisizione() {
+      // Resetta eventuali anteprime precedenti
+      annullaScatto();
+      const startBtn = document.getElementById("startBtn");
+      startBtn.disabled = true;
+      startBtn.innerText = "⏳ Acquisizione GPS in corso...";
+
+      if ("geolocation" in navigator) {
+        navigator.geolocation.getCurrentPosition(
+          (pos) => {
+            // Coordinate ottenute con successo
+            tempCoords = {
+              lat: pos.coords.latitude.toFixed(6),
+              lng: pos.coords.longitude.toFixed(6),
+              alt: pos.coords.altitude !== null ? pos.coords.altitude.toFixed(1) : "N/D",
+              acc: pos.coords.accuracy.toFixed(1),
+              timestamp: new Date().toLocaleString()
+            };
+            
+            // Ripristina bottone e apri fotocamera nativa
+            startBtn.disabled = false;
+            startBtn.innerText = "📷 Scatta Nuova Foto GPS";
+            document.getElementById("cameraInput").click();
+          },
+          (err) => {
+            // Gestione errore GPS (es. GPS spento o nessun segnale)
+            alert("Errore GPS: " + err.message + "\nAssicurati di essere all'aperto e di aver attivato la geolocalizzazione.");
+            startBtn.disabled = false;
+            startBtn.innerText = "📷 Scatta Nuova Foto GPS";
+          },
+          // Impostazioni per massima precisione GPS
+          { enableHighAccuracy: true, timeout: 25000, maximumAge: 0 }
+        );
+      } else {
+        alert("Geolocalizzazione non supportata dal tuo browser.");
+        startBtn.disabled = false;
+      }
+    }
+
+    // 3. FASE 2: Gestione dell'immagine scattata e Mostra Anteprima
+    document.getElementById("cameraInput").addEventListener("change", function(e) {
+      const file = e.target.files[0];
+      if (!file || !tempCoords) {
+        annullaScatto();
+        return;
+      }
+
+      // Legge il file immagine e lo converte in Base64 per la visualizzazione/salvataggio
+      const reader = new FileReader();
+      reader.onload = function(event) {
+        tempPhotoBase64 = event.target.result;
+
+        // Visualizza l'immagine nell'area di anteprima
+        document.getElementById("currentPreviewImg").src = tempPhotoBase64;
+        
+        // Visualizza i dati GPS associati nell'anteprima
+        document.getElementById("currentGPSData").innerHTML = `
+          <strong>Data/Ora:</strong> ${tempCoords.timestamp}<br>
+          <strong>Lat/Lng:</strong> ${tempCoords.lat}, ${tempCoords.lng}<br>
+          <strong>Altitudine s.l.m.:</strong> ${tempCoords.alt} m (Acc: ±${tempCoords.acc}m)
+        `;
+
+        // Mostra l'area di anteprima e nasconde il pulsante principale
+        document.getElementById("startBtn").style.display = "none";
+        document.getElementById("previewArea").style.display = "block";
+      };
+      reader.readAsDataURL(file);
+    });
+
+    // 4. FASE 3: Salva Rilievo Definitivo in IndexedDB
+    function salvaRilievoDefinitivo() {
+      if (!tempPhotoBase64 || !tempCoords || !db) return;
+
+      const record = {
+        fotoBase64: tempPhotoBase64,
+        coords: tempCoords
+      };
+
+      // Transazione di scrittura nel DB locale
+      const tx = db.transaction("rilievi", "readwrite");
+      const store = tx.objectStore("rilievi");
+      const request = store.add(record);
+
+      request.onsuccess = () => {
+        // Successo: resetta l'anteprima, mostra bottone principale e aggiorna galleria
+        annullaScatto();
+        aggiornaGalleria();
+        alert("Scatto confermato e salvato nella coda locale!");
+      };
+
+      request.onerror = (e) => {
+        alert("Errore durante il salvataggio locale: " + e.target.error);
+      };
+    }
+
+    // Funzione di reset per annullare lo scatto corrente
+    function annullaScatto() {
+      tempCoords = null;
+      tempPhotoBase64 = null;
+      document.getElementById("currentPreviewImg").src = "";
+      document.getElementById("currentGPSData").innerText = "Attesa dati GPS...";
+      document.getElementById("previewArea").style.display = "none";
+      document.getElementById("startBtn").style.display = "block";
+      // Resetta l'input file per permettere di ricaricare la stessa foto se necessario
+      document.getElementById("cameraInput").value = ""; 
+    }
+
+    // --- GESTIONE GALLERIA E INVIO ---
+
+    // 5. Mostra Galleria delle foto salvate offline
+    function aggiornaGalleria() {
+      if (!db) return;
+      const tx = db.transaction("rilievi", "readonly");
+      const store = tx.objectStore("rilievi");
+      const request = store.getAll();
+
+      request.onsuccess = () => {
+        const items = request.result;
+        document.getElementById("count").innerText = items.length;
+        const container = document.getElementById("gallery");
+        container.innerHTML = "";
+
+        // Ordina per data decrescente (più recenti per prime)
+        items.sort((a,b) => new Date(b.coords.timestamp) - new Date(a.coords.timestamp));
+
+        items.forEach(item => {
+          const div = document.createElement("div");
+          div.className = "photo-item";
+          div.innerHTML = `
+            <div>
+              <img src="${item.fotoBase64}">
+              <strong>${item.coords.timestamp}</strong><br>
+              Lat: ${item.coords.lat}<br>
+              Lng: ${item.coords.lng}<br>
+              Alt: ${item.coords.alt} m
+            </div>
+            <div>
+              <button class="btn btn-single" onclick="inviaSingolaMail(${item.id})">✉️ Invia Dati</button>
+              <button class="btn btn-delete" onclick="eliminaRilevamento(${item.id})">🗑️ Elimina</button>
+            </div>
+          `;
+          container.appendChild(div);
+        });
+      };
+    }
+
+    // 6A. Invia dati SINGOLO Rilievo via Email
+    function inviaSingolaMail(id) {
+      const tx = db.transaction("rilievi", "readonly");
+      const store = tx.objectStore("rilievi");
+      const request = store.get(id);
+
+      request.onsuccess = () => {
+        const item = request.result;
+        if (!item) return;
+
+        let testoBody = `RILEVAMENTO FOTOGRAFICO SINGOLO\n==============================\n\n`;
+        testoBody += `Data/Ora: ${item.coords.timestamp}\n`;
+        testoBody += `Latitudine: ${item.coords.lat}\n`;
+        testoBody += `Longitudine: ${item.coords.lng}\n`;
+        testoBody += `Altitudine s.l.m.: ${item.coords.alt} m (Accuratezza: ±${item.coords.acc}m)\n\n`;
+        testoBody += `Link Mappe: https://maps.google.com/?q=${item.coords.lat},${item.coords.lng}\n\n`;
+        testoBody += `NOTA: Ricordati di allegare la foto relativa da Galleria/File!\n`;
+
+        const oggetto = `Rilevamento GPS - ${item.coords.timestamp}`;
+        const mailtoLink = `mailto:?subject=${encodeURIComponent(oggetto)}&body=${encodeURIComponent(testoBody)}`;
+        window.location.href = mailtoLink;
+      };
+    }
+
+    // 6B. Invia Report COMPLETO di tutti i Rilievi
+    function inviaTuttoViaMail() {
+      const tx = db.transaction("rilievi", "readonly");
+      const store = tx.objectStore("rilievi");
+      const request = store.getAll();
+
+      request.onsuccess = () => {
+        const items = request.result;
+        if (items.length === 0) {
+          alert("Nessun elemento nella coda locale.");
+          return;
+        }
+
+        let testoBody = "REPORT COMPLETO RILIEVI FOTOGRAFICI GPS\n======================================\n\n";
+        items.forEach((item, index) => {
+          testoBody += `[FOTO ${index + 1}]\n`;
+          testoBody += `Data/Ora: ${item.coords.timestamp}\n`;
+          testoBody += `Coordinate: ${item.coords.lat}, ${item.coords.lng}\n`;
+          testoBody += `Altitudine s.l.m.: ${item.coords.alt} m\n`;
+          testoBody += `Mappe: https://maps.google.com/?q=${item.coords.lat},${item.coords.lng}\n\n`;
+        });
+
+        testoBody += `\nNOTA: Ricordati di allegare le foto scattate da Galleria/File prima di inviare l'email!`;
+
+        const oggetto = `Report Finale: ${items.length} Rilievi GPS`;
+        const mailtoLink = `mailto:?subject=${encodeURIComponent(oggetto)}&body=${encodeURIComponent(testoBody)}`;
+        window.location.href = mailtoLink;
+      };
+    }
+
+    // 7. Elimina un singolo rilievo dalla coda locale
+    function eliminaRilevamento(id) {
+      if (confirm("Vuoi davvero eliminare questo rilievo dalla coda locale?")) {
+        const tx = db.transaction("rilievi", "readwrite");
+        tx.objectStore("rilievi").delete(id);
+        tx.oncomplete = () => aggiornaGalleria();
+      }
+    }
+  </script>
+</body>
+</html>
